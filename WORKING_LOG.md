@@ -1,0 +1,21 @@
+# Working Log — Video Diffusion Serving on TorchTPU
+
+## Goal
+Bring up and benchmark video diffusion models on Google Cloud TPU v7x and TPU v5p using PyTorch / TorchTPU (`sglang-torchtpu` and `vllm-torchtpu` + `vllm-omni`), and evaluate whether offloading H.264 MP4 encoding from the TPU host to a separate CPU node improves end-to-end latency.
+
+## What We Tried & Found
+
+### 1. Stage-Level Profiling & Solving 3D VAE Memory Limits on `Wan2.2-T2V-A14B`
+- Initial runs of `Wan2.2-T2V-A14B` (`832×480 × 81f`, 20 steps) completed 20-step `DenoisingStage` cleanly (`16.52 s` on 4-chip TPU v7x `U=8` with `tpu_splash_attn` vs. `30.47 s` on 4-chip TPU v5p `U=4` — a `1.85×` speedup on TPU v7x), but hit VMEM/HBM OOM during monolithic 81-frame 3D VAE decoding.
+- **Resolution:** Enabling `--vae-config.use-parallel-decode --vae-config.parallel-decode-mode tiled` in `sglang-torchtpu` kept TPU v7x peak HBM at `60.3–71.4 GB` per TensorCore and produced `ffprobe`-verified 81-frame H.264 MP4s end-to-end in `68.99 s` (`832×480`) and `148.71 s` (`1280×720`).
+- **TPU v5p memory boundary:** On 4-chip TPU v5p (`380 GB` total HBM vs. `768 GB` on 4-chip TPU v7x), holding the dual 14B transformers + T5-XXL + tiled VAE fell short by `17 MB` during decode allocation (`76.17M` requested vs. `59.10M` free). Enabling `--text-encoder-cpu-offload` booted cleanly in `730.4 s`, but running 11B T5-XXL `TextEncodingStage` on host CPU exceeded `20 min` per prompt.
+
+### 2. Local TPU Host vs. Remote CPU H.264 Post-Processing A/B
+- Benchmarked 81-frame RGB24 -> H.264 MP4 encoding (`libx264 ultrafast`, `CRF 20`) locally on the 224-vCPU TPU v7x host vs. streaming raw RGB24 frames over TCP to a dedicated `c3-standard-44` AVX-512 offload node.
+- **Finding:** Local 16-thread encoding was faster at `c=1` (`239.4 ms` vs. `277.7 ms` at 480p, `-14%`; `469.2 ms` vs. `520.2 ms` at 720p, `-10%`) because transferring `97–224 MB` of uncompressed frames over TCP outweighs the remote CPU advantage unless the TPU host CPU is saturated by concurrent streams.
+
+### 3. `Wan2.2-I2V`, `Wan2.2-Animate-2`, `SANA-Video-2B`, and `vllm-omni` Findings
+- **`Wan2.2-T2V-A14B` on `vllm-omni 0.33.0rc1`:** Initially returned `HTTP 400` on JSON payloads because `/v1/videos` expects `multipart/form-data`. Switching to `multipart/form-data` on 4-chip TPU v7x (`U=4`) produced verified 81-frame `16 fps` H.264 MP4s (`pixel_std = 61.2–64.1`) in **`40.06 s` warm** (`212.42 s` cold) at `832×480` (`1.72×` faster warm than `sglang`) and **`137.20 s` warm** (`229.41 s` cold) at `1280×720`.
+- **`Wan2.2-I2V-A14B`:** On `vllm-omni 0.33.0rc1` (`U=4`, TPU v7x), cold startup exceeded the default 600 s orchestrator timeout; passing `--init-timeout 1800 --stage-init-timeout 1800` (57 s warm cache boot) and uploading the conditioning frame as `input_reference` via `multipart/form-data` produced verified 81-frame `16 fps` H.264 MP4s (`pixel_std = 46.3–75.6`) in **`42.07 s` warm** (`71.29 s` cold) at `832×480` and **`140.21 s` warm** (`168.27 s` cold) at `1280×720`. On `sglang-torchtpu`, default `dit_cpu_offload=True` triggered host cgroup OOM across 8 workers on TPU v7x, and tiled parallel VAE decode on TPU v5p (`U=4`) hit `PjRtBuffer::CopyToRemoteDevice: Remote size 23040 is not identical to local size 737280` inside `parallel_conv.py` `halo_exchange`.
+- **`Wan2.2-Animate-2-14B-Distilled`:** On `sglang-torchtpu`, passing `--attention-backend tpu_splash_attn` is rejected at startup because the pipeline mandates `torch.nn.attention.flex_attention`; dropping `--attention-backend` lets it boot in `393 s` (`59 s` warm cache) on TPU v7x, and passing both `"input_reference"` and `"video_path"` reaches `WanAnimate2BeforeDenoisingStage`, where `torch_tpu 0.2.0` currently raises `NotImplementedError: could not find kernel for HigherOrderOperator flex_attention at dispatch key DispatchKey.AutocastPrivateUse1`. On `vllm-omni 0.33.0rc1`, startup fails with `ValueError: Model class WanAnimate2Pipeline not found in diffusion model registry.`
+- **`SANA-Video-2B`:** Tested on both `sglang-torchtpu` (`U=1`/`U=4`, boots cleanly but hits a tensor-dimension mismatch inside the scheduler) and `vllm-omni 0.33.0rc1` (`U=4`, fails startup with `PjRtBuffer::CopyToRemoteDevice` remote/local size mismatch). Both remain open upstream issues.
